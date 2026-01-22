@@ -26,8 +26,13 @@ DB_FILE = os.getenv("DB_PATH", "chat_history.db")
 MAX_MSGS = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "512"))
 CONCURRENCY = int(os.getenv("REQUEST_SEMAPHORE_LIMIT", "4"))
-# default HUMANIZE_LEVEL теперь служит как значение по умолчанию, но можно менять per-chat
 DEFAULT_HUMANIZE_LEVEL = int(os.getenv("HUMANIZE_LEVEL", "1"))
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "Ты — ассистент по ревью Python-кода. Задача: находить баги, уязвимости и потенциальные гонки, объяснить причину и показать точное место (функция/строка). Для каждого найденного бага: 1) кратко опиши проблему, 2) предложи исправление с примером кода (патч), 3) укажи как воспроизвести или тест-кейс. Особое внимание: работа с SQLite в многопоточном/асинхронном окружении, семафор и конкурентные вызовы, обработка ошибок API, возможные None, граничные случаи с длинными сообщениями и разбиением на чанки, редактирование reply_markup, утечки соединений и ресурсные ошибки. Отвечай коротко и по делу, давай минимум шума."
+)
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -50,7 +55,6 @@ conn.commit()
 
 semaphore = asyncio.Semaphore(CONCURRENCY)
 
-# in-memory per-chat settings (humanize level). Можно заменить на хранение в БД при необходимости
 chat_settings: dict[int, dict] = {}
 
 
@@ -86,7 +90,6 @@ def save(chat_id: int, role: str, content: str):
 
 
 def create_control_kb(chat_id: int):
-    # Берём уровень humanize из настроек или по умолчанию
     level = get_chat_setting(chat_id, "humanize", DEFAULT_HUMANIZE_LEVEL)
     kb = InlineKeyboardMarkup(
         [
@@ -106,7 +109,6 @@ def create_control_kb(chat_id: int):
 async def send_with_control_buttons(update: Update, text: str):
     cid = update.effective_chat.id
     kb = create_control_kb(cid)
-    # Оборачиваем в reply, если есть message (в командах update.message может отсутствовать)
     if update.message:
         await update.message.reply_text(text, reply_markup=kb)
     else:
@@ -117,7 +119,6 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     cur.execute("DELETE FROM history WHERE chat_id=?", (cid,))
     conn.commit()
-    # сброс настроек
     set_chat_setting(cid, "humanize", DEFAULT_HUMANIZE_LEVEL)
     await send_with_control_buttons(update, "Добро пожаловать! Я готов отвечать.")
 
@@ -140,13 +141,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("DELETE FROM history WHERE chat_id=?", (cid,))
         conn.commit()
         await context.bot.send_message(cid, "Контекст очищен.")
-        # обновим кнопку стиль на уровне по умолчанию
         set_chat_setting(cid, "humanize", DEFAULT_HUMANIZE_LEVEL)
         await context.bot.send_message(cid, f"Стиль сброшен на {DEFAULT_HUMANIZE_LEVEL}.")
         return
 
     if data == "delete_last":
-        # удалить последний ответ ассистента
         row = cur.execute(
             "SELECT rowid FROM history WHERE chat_id=? AND role='assistant' ORDER BY ts DESC LIMIT 1",
             (cid,),
@@ -160,7 +159,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "regenerate":
-        # найдём последний пользовательский запрос
         user_row = cur.execute(
             "SELECT content FROM history WHERE chat_id=? AND role='user' ORDER BY ts DESC LIMIT 1",
             (cid,),
@@ -170,7 +168,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         last_user_text = user_row[0]
 
-        # удалим последний ответ ассистента (если есть) — чтобы не дублировать
         last_assistant = cur.execute(
             "SELECT rowid FROM history WHERE chat_id=? AND role='assistant' ORDER BY ts DESC LIMIT 1",
             (cid,),
@@ -181,15 +178,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(cid, "Перегенерирую ответ...")
 
-        # построим сообщения и вызовем модель (используем те же функции, что в on_message)
-        system_prompt = os.getenv("SYSTEM_PROMPT", "Отвечай кратко и по делу.")
+        system_prompt = SYSTEM_PROMPT
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(get_history(cid))
-        # добавим последний user (на случай, если он не в истории — но обычно он там)
         if not any(m.get("role") == "user" and m.get("content") == last_user_text for m in messages):
             messages.append({"role": "user", "content": last_user_text})
 
-        # асинхронно вызвать модель
         try:
             async with semaphore:
                 reply = await call_model(messages)
@@ -210,7 +204,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not reply.strip():
             reply = "Извините, не удалось получить ответ."
 
-        # humanize по настройке чата
         level = get_chat_setting(cid, "humanize", DEFAULT_HUMANIZE_LEVEL)
         try:
             humanized = humanize_reply(reply, level)
@@ -219,7 +212,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save(cid, "assistant", humanized)
 
-        # отправляем с кнопками
         kb = create_control_kb(cid)
         CHUNK = 3900
         first = True
@@ -234,11 +226,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "toggle_humanize":
         cur_level = get_chat_setting(cid, "humanize", DEFAULT_HUMANIZE_LEVEL)
-        # циклически переключаем 0 -> 1 -> 2 -> 0
         new_level = (cur_level + 1) % 3
         set_chat_setting(cid, "humanize", new_level)
         await context.bot.send_message(cid, f"Стиль изменён: {new_level}")
-        # обновим кнопки в сообщении (опционально можно редактировать сообщение с кнопками)
         try:
             kb = create_control_kb(cid)
             await q.message.edit_reply_markup(reply_markup=kb)
@@ -275,7 +265,6 @@ async def call_model(messages):
     return await loop.run_in_executor(None, api_call)
 
 
-# --- оставляем ваши вспомогательные функции без изменений ---
 def _replace_formal_phrases(text: str) -> str:
     replacements = {
         r"\bвоспользуйтесь\b": "используйте",
@@ -360,7 +349,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     save(cid, "user", user_text)
 
-    system_prompt = os.getenv("SYSTEM_PROMPT", "Отвечай кратко и по делу.")
+    system_prompt = SYSTEM_PROMPT
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(get_history(cid))
 
@@ -386,7 +375,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reply.strip():
         reply = "Извините, не удалось получить ответ."
 
-    # humanize по настройке чата
     level = get_chat_setting(cid, "humanize", DEFAULT_HUMANIZE_LEVEL)
     try:
         humanized = humanize_reply(reply, level)
